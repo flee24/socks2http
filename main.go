@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +12,13 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	flag "github.com/spf13/pflag"
+)
+
+const (
+	defaultListenAddr = "127.0.0.1:5566"
+	defaultSocks5Addr = "127.0.0.1:5555"
 )
 
 // version is injected at link time, e.g. go build -ldflags="-X main.version=v1.2.3"
@@ -27,16 +33,50 @@ type Config struct {
 }
 
 func main() {
-	showVersion := flag.Bool("version", false, "print version and exit")
+	var (
+		configPath  string
+		listenAddr  string
+		socks5Addr  string
+		username    string
+		password    string
+		debug       bool
+		showVersion bool
+	)
+
+	flag.StringVarP(&configPath, "config", "c", "", "path to JSON config file (overrides other flags)")
+	flag.StringVarP(&listenAddr, "listen", "l", defaultListenAddr, "HTTP proxy listen address (host:port)")
+	flag.StringVarP(&socks5Addr, "socks5", "s", defaultSocks5Addr, "upstream SOCKS5 server (host:port)")
+	flag.StringVarP(&username, "user", "u", "", "SOCKS5 username")
+	flag.StringVarP(&password, "password", "p", "", "SOCKS5 password")
+	flag.BoolVarP(&debug, "debug", "d", false, "enable per-request logging")
+	flag.BoolVarP(&showVersion, "version", "v", false, "print version and exit")
 	flag.Parse()
-	if *showVersion {
+
+	if showVersion {
 		fmt.Println(version)
 		return
 	}
 
-	cfg, err := loadConfig("config.json")
-	if err != nil {
-		log.Fatalf("failed to load config.json: %v", err)
+	var (
+		cfg Config
+		err error
+	)
+	if configPath != "" {
+		cfg, err = loadConfig(configPath)
+		if err != nil {
+			log.Fatalf("failed to load %s: %v", configPath, err)
+		}
+	} else {
+		cfg = Config{
+			ListenAddr: listenAddr,
+			Socks5Addr: socks5Addr,
+			Username:   username,
+			Password:   password,
+			Debug:      debug,
+		}
+		if err := validateConfig(cfg); err != nil {
+			log.Fatalf("invalid configuration: %v", err)
+		}
 	}
 
 	server := &http.Server{
@@ -60,13 +100,20 @@ func loadConfig(path string) (Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return Config{}, err
 	}
-	if cfg.ListenAddr == "" {
-		return Config{}, fmt.Errorf("listen_addr is required")
-	}
-	if cfg.Socks5Addr == "" {
-		return Config{}, fmt.Errorf("socks5_addr is required")
+	if err := validateConfig(cfg); err != nil {
+		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func validateConfig(cfg Config) error {
+	if cfg.ListenAddr == "" {
+		return fmt.Errorf("listen_addr is required")
+	}
+	if cfg.Socks5Addr == "" {
+		return fmt.Errorf("socks5_addr is required")
+	}
+	return nil
 }
 
 func buildHandler(cfg Config) http.Handler {
