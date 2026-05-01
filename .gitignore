@@ -1,0 +1,18 @@
+# Binary build output
+/socks2http
+/socks2http.exe
+
+# Local config (copy from config.example.json)
+/config.json
+
+# Go
+*.test
+*.out
+/vendor/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

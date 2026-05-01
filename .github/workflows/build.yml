@@ -1,0 +1,55 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+            ext: ""
+          - goos: linux
+            goarch: arm64
+            suffix: linux-arm64
+            ext: ""
+          - goos: windows
+            goarch: amd64
+            suffix: windows-amd64
+            ext: .exe
+          - goos: darwin
+            goarch: amd64
+            suffix: darwin-amd64
+            ext: ""
+          - goos: darwin
+            goarch: arm64
+            suffix: darwin-arm64
+            ext: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+          VERSION: ${{ github.ref_name }}+${{ github.sha }}
+        run: go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "socks2http-${{ matrix.suffix }}${{ matrix.ext }}" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: socks2http-${{ matrix.suffix }}
+          path: socks2http-${{ matrix.suffix }}${{ matrix.ext }}
