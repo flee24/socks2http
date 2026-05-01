@@ -10,18 +10,33 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	flag "github.com/spf13/pflag"
 )
+
+var hopByHopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Proxy-Connection",
+	"TE",
+	"Trailers",
+	"Transfer-Encoding",
+	"Upgrade",
+}
 
 const (
 	defaultListenAddr = "127.0.0.1:5566"
 	defaultSocks5Addr = "127.0.0.1:5555"
 )
 
-// version is injected at link time, e.g. go build -ldflags="-X main.version=v1.2.3"
 var version = "dev"
 
 type Config struct {
@@ -80,9 +95,22 @@ func main() {
 	}
 
 	server := &http.Server{
-		Addr:    cfg.ListenAddr,
-		Handler: buildHandler(cfg),
+		Addr:              cfg.ListenAddr,
+		Handler:           buildHandler(cfg),
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		<-ctx.Done()
+		log.Printf("shutting down...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
 
 	log.Printf("socks2http %s — starting http proxy on %s via socks5 %s", version, cfg.ListenAddr, cfg.Socks5Addr)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -108,10 +136,31 @@ func loadConfig(path string) (Config, error) {
 
 func validateConfig(cfg Config) error {
 	if cfg.ListenAddr == "" {
-		return fmt.Errorf("listen_addr is required")
+		return errors.New("listen_addr is required")
+	}
+	if err := validateAddr("listen_addr", cfg.ListenAddr, false); err != nil {
+		return err
 	}
 	if cfg.Socks5Addr == "" {
-		return fmt.Errorf("socks5_addr is required")
+		return errors.New("socks5_addr is required")
+	}
+	if err := validateAddr("socks5_addr", cfg.Socks5Addr, true); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateAddr(label, addr string, requireHost bool) error {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%s %q: %w", label, addr, err)
+	}
+	if requireHost && host == "" {
+		return fmt.Errorf("%s %q: host is required", label, addr)
+	}
+	n, err := strconv.Atoi(portStr)
+	if err != nil || n < 0 || n > 65535 {
+		return fmt.Errorf("%s %q: invalid port", label, addr)
 	}
 	return nil
 }
@@ -136,7 +185,7 @@ func buildHandler(cfg Config) http.Handler {
 func handleHTTP(w http.ResponseWriter, r *http.Request, cfg Config) {
 	outReq := r.Clone(r.Context())
 	outReq.RequestURI = ""
-	outReq.Header.Del("Proxy-Connection")
+	removeHopByHopHeaders(outReq.Header)
 
 	transport := &http.Transport{
 		Proxy: nil,
@@ -153,6 +202,7 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, cfg Config) {
 	}
 	defer resp.Body.Close()
 
+	removeHopByHopHeaders(resp.Header)
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
@@ -180,17 +230,21 @@ func handleConnect(w http.ResponseWriter, r *http.Request, cfg Config) int {
 
 	_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
+		defer wg.Done()
 		defer clientConn.Close()
 		defer targetConn.Close()
 		_, _ = io.Copy(targetConn, clientConn)
 	}()
-
 	go func() {
+		defer wg.Done()
 		defer clientConn.Close()
 		defer targetConn.Close()
 		_, _ = io.Copy(clientConn, targetConn)
 	}()
+	wg.Wait()
 
 	return http.StatusOK
 }
@@ -231,7 +285,7 @@ func socks5Handshake(conn net.Conn, username, password, target string) error {
 	}
 
 	reply := make([]byte, 2)
-	if _, err := readFull(conn, reply); err != nil {
+	if _, err := io.ReadFull(conn, reply); err != nil {
 		return err
 	}
 	if reply[0] != 0x05 {
@@ -256,7 +310,7 @@ func socks5Handshake(conn net.Conn, username, password, target string) error {
 	}
 
 	resp := make([]byte, 4)
-	if _, err := readFull(conn, resp); err != nil {
+	if _, err := io.ReadFull(conn, resp); err != nil {
 		return err
 	}
 	if resp[1] != 0x00 {
@@ -284,7 +338,7 @@ func socks5UserPassAuth(conn net.Conn, username, password string) error {
 	}
 
 	resp := make([]byte, 2)
-	if _, err := readFull(conn, resp); err != nil {
+	if _, err := io.ReadFull(conn, resp); err != nil {
 		return err
 	}
 	if resp[1] != 0x00 {
@@ -325,7 +379,7 @@ func discardBoundAddr(conn net.Conn, atyp byte) error {
 		toRead = 4 + 2
 	case 0x03:
 		l := make([]byte, 1)
-		if _, err := readFull(conn, l); err != nil {
+		if _, err := io.ReadFull(conn, l); err != nil {
 			return err
 		}
 		toRead = int(l[0]) + 2
@@ -336,7 +390,7 @@ func discardBoundAddr(conn net.Conn, atyp byte) error {
 	}
 
 	buf := make([]byte, toRead)
-	_, err := readFull(conn, buf)
+	_, err := io.ReadFull(conn, buf)
 	return err
 }
 
@@ -359,8 +413,17 @@ func copyHeader(dst, src http.Header) {
 	}
 }
 
-func readFull(conn net.Conn, b []byte) (int, error) {
-	return io.ReadFull(conn, b)
+func removeHopByHopHeaders(h http.Header) {
+	if c := h.Get("Connection"); c != "" {
+		for _, f := range strings.Split(c, ",") {
+			if name := strings.TrimSpace(f); name != "" {
+				h.Del(name)
+			}
+		}
+	}
+	for _, name := range hopByHopHeaders {
+		h.Del(name)
+	}
 }
 
 func logRequest(cfg Config, r *http.Request, clientAddr string, status int, started time.Time) {
