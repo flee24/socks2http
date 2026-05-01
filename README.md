@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="socks2proxy.png" alt="socks2http" />
+</p>
+
 # socks2http
 
 Small HTTP proxy that tunnels client traffic through a SOCKS5 server. Use it when apps or tools only support an HTTP proxy but your network path is SOCKS5.
